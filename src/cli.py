@@ -1,4 +1,5 @@
 # Main CLI (Command Line Interface) script
+# venv activation: source .venv/bin/activate
 
 """
 hg38 download (primary assembly):
@@ -25,7 +26,7 @@ Example invalid inputs:
 - gene XYZ123 → Fails (gene does not exist).
 
 """
-
+from tqdm import tqdm
 import argparse
 import pandas as pd
 import numpy as np
@@ -36,7 +37,7 @@ from .utils import (
     validate_sequence_length
 )
 from .pam import find_pam_sites, filter_sgrnas
-from .scoring import DeepCRISPRScorer
+from .scoring import DeepSpCas9Scorer
 
 def compute_gc(seq):
     """
@@ -50,59 +51,66 @@ def compute_gc(seq):
     gc_count = sum(1 for base in seq if base in "GC")
     return gc_count / len(seq)
 
-def off_target_analysis(sgRNA, bowtie_index):
+def batch_off_target_analysis(sgRNA_list, bowtie_index):
     """
-    Run Bowtie to search for off-targets for the sgRNA in the human genome.
-    
-    This function writes the sgRNA (20bp guide) in FASTA format to a temporary file,
-    then calls Bowtie using the provided Bowtie index (for the human genome, e.g., GRCh38_primary).
-    
-    It allows up to 2 mismatches (-v 2) and reports all valid alignments (-a).
+    Write all sgRNAs in sgRNA_list to a single FASTA file, run Bowtie once,
+    and parse the output to count off-target hits for each sgRNA.
     
     Args:
-        sgRNA (str): 20bp sgRNA sequence.
-        bowtie_index (str): Path to the Bowtie index prefix for the human genome.
-                            For your index files, this should be "GRCh38_primary" (or with the directory path, e.g., "genome/GRCh38_primary").
-    Returns:
-        int: Number of off-target hits (i.e. alignments found by Bowtie).
-    """
-    import tempfile
-    import subprocess
-    import os
+        sgRNA_list (list of str): List of 20bp sgRNA sequences.
+        bowtie_index (str): Path to Bowtie index prefix (e.g., "bowtie_index/GRCh38_primary").
     
-    # Write sgRNA to a temporary FASTA file.
-    fasta_content = f">candidate\n{sgRNA}\n"
+    Returns:
+        dict: Mapping from candidate header (e.g., "candidate_1") to off-target hit count.
+    """
+    import tempfile, subprocess, os
+    import time
+
+    start_time = time.time()
+    # Create a temporary FASTA file with all candidates.
+    fasta_lines = []
+    for i, sgRNA in enumerate(sgRNA_list, 1):
+        fasta_lines.append(f">candidate_{i}")
+        fasta_lines.append(sgRNA)
+    fasta_content = "\n".join(fasta_lines) + "\n"
+    
     with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".fa") as temp_fasta:
         temp_fasta.write(fasta_content)
         temp_fasta_path = temp_fasta.name
-
-    # Build Bowtie command.
-    # -v 2 : allow up to 2 mismatches.
-    # -a    : report all valid alignments.
-    # --best --strata : report the best alignments.
-    # -f   : input is in FASTA format.
+    
+    # Build Bowtie command: allow up to 2 mismatches (-v 2), report all alignments (-a), etc.
     cmd = [
-        "bowtie", 
-        "-v", "2", 
-        "-a", 
-        "--best", 
-        "--strata", 
-        bowtie_index,  # This should match the index prefix (e.g., "GRCh38_primary" or "genome/GRCh38_primary")
-        "-f", 
+        "bowtie",
+        "-v", "2",
+        "-a",
+        "--best",
+        "--strata",
+        bowtie_index,
+        "-f",
         temp_fasta_path
     ]
     
     try:
         output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, universal_newlines=True)
-        # Count the number of alignment lines.
-        off_target_hits = len(output.strip().splitlines())
+        # Parse Bowtie output.
+        # Each alignment line typically starts with the candidate header.
+        off_target_counts = {}
+        for line in output.strip().splitlines():
+            # Example Bowtie output format:
+            # candidate_1    chr1    12345    +   0   ... 
+            parts = line.split('\t')
+            candidate = parts[0]
+            off_target_counts[candidate] = off_target_counts.get(candidate, 0) + 1
     except subprocess.CalledProcessError as e:
         print("Bowtie error output:", e.output)
-        off_target_hits = 0
+        off_target_counts = {}
     finally:
         os.remove(temp_fasta_path)
     
-    return off_target_hits
+    elapsed = time.time() - start_time
+    print(f"Batch off-target analysis took {elapsed:.2f} seconds.")
+    
+    return off_target_counts
 
 def main():
     """
@@ -116,7 +124,7 @@ def main():
       2. Find PAM sites (both strands).
       3. Filter sgRNAs (GC content, homopolymers, etc.).
       4. Extract 30bp sequences (5bp up/downstream).
-      5. Load DeepCRISPR model & predict efficiency scores.
+      5. Load DeepSpCas9 model & predict efficiency scores.
       6. For each candidate, compute GC content and off-target hits using Bowtie.
       7. Save results to CSV.
 
@@ -128,7 +136,7 @@ def main():
     parser.add_argument("--gene", type=str, help="Gene name (e.g., TP53)")
     parser.add_argument("--pam", type=str, default="NGG", help="PAM motif (default: NGG)")
     parser.add_argument("--model_dir", type=str, default="models/", 
-                        help="Path to DeepCRISPR checkpoint directory")
+                        help="Path to DeepSpCas9 checkpoint directory")
     parser.add_argument("--bowtie_index", type=str, help="Path to Bowtie index prefix for human genome (e.g., genome/hg38_index)")
     parser.add_argument("--output", type=str, help="Output CSV file")
     args = parser.parse_args()
@@ -148,7 +156,7 @@ def main():
         candidates = find_pam_sites(sequence, pam=args.pam, strand="both")
         filtered = filter_sgrnas(candidates)
         
-        # 3. Extract 30bp context (5bp upstream + 20bp sgRNA + 5bp downstream)
+       # 3. Extract 30bp context (5bp upstream + 20bp sgRNA + 5bp downstream)
         sgRNAs_30bp = []
         valid_sgrnas = []
         for sgrna, start, end, strand in filtered:
@@ -170,21 +178,30 @@ def main():
         if not valid_sgrnas:
             raise ValueError("No valid sgRNAs found after filtering/flanking checks.")
         
-        # 4. Initialize DeepCRISPR scorer and predict efficiency.
-        scorer = DeepCRISPRScorer(checkpoint_dir=args.model_dir)
-        encoded = np.array([scorer.one_hot_encode(seq) for seq in sgRNAs_30bp])
-        preds = scorer.model.predict(encoded)
-        efficiency_scores = preds.flatten().tolist()
+        # 4. Initialize DeepSpCas9 scorer and predict efficiency.
+        scorer = DeepSpCas9Scorer(checkpoint_dir=args.model_dir)
         
+        # Wrap the one-hot encoding loop with tqdm for progress feedback.
+        # encoded = np.array([scorer.one_hot_encode(seq) for seq in tqdm(sgRNAs_30bp, desc="Encoding sgRNAs", disable=False)]) # returns a symbolic tensor 
+        # preds = scorer.model.predict(encoded)
+        # efficiency_scores = preds.flatten().tolist()
+        efficiency_scores = scorer.predict_efficiency(sgRNAs_30bp)
+
+
+        # Collect the 20bp guide sequences from valid_sgrnas:
+        candidate_guides = [sgrna for sgrna, _, _, _ in valid_sgrnas]
+
+        # Run batch off-target analysis:
+        if args.bowtie_index:
+            off_target_results = batch_off_target_analysis(candidate_guides, args.bowtie_index)
+        else:
+            off_target_results = {}
+                
         # 5. Compile results including GC content and off-target hits.
         results = []
-        for (sgrna, start, end, strand), score in zip(valid_sgrnas, efficiency_scores):
-            gc = compute_gc(sgrna)  # Compute GC content of the 20bp guide.
-            # If bowtie_index is provided, run off-target analysis.
-            if args.bowtie_index:
-                off_target_hits = off_target_analysis(sgrna, args.bowtie_index)
-            else:
-                off_target_hits = "NA"
+        for i, ((sgrna, start, end, strand), score) in enumerate(zip(valid_sgrnas, efficiency_scores), 1):
+            gc = compute_gc(sgrna)
+            off_target_hits = off_target_results.get(f"candidate_{i}", "NA")
             results.append({
                 "sgRNA_20bp": sgrna,
                 "Start": start,
@@ -194,7 +211,7 @@ def main():
                 "GC_Content": gc,
                 "OffTarget_Hits": off_target_hits
             })
-        
+                
         df = pd.DataFrame(results).sort_values("Efficiency", ascending=False)
         if args.output:
             df.to_csv(args.output, index=False)
@@ -202,7 +219,7 @@ def main():
         
         top = df.iloc[0]
         print(f"Top sgRNA: {top['sgRNA_20bp']} (Score: {top['Efficiency']:.4f}, GC: {top['GC_Content']:.2f}, OffTarget: {top['OffTarget_Hits']})")
-    
+        
     except Exception as e:
         print(f"Error: {e}")
 

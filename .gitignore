@@ -6,3 +6,4 @@ __pycache__/
 bowtie_index/
 data/
 *.sh
+*.csv
